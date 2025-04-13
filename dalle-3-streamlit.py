@@ -38,6 +38,8 @@ if st.button("Generate Image"):
                 # If an image is uploaded, include it in the prompt
                 if uploaded_image:
                     image = Image.open(uploaded_image)
+                    if image.mode == 'RGBA':
+                        image = image.convert("RGB")
                     buffered = io.BytesIO()
                     image.save(buffered, format="JPEG")
                     image_data = buffered.getvalue()
