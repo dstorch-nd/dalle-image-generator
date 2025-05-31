@@ -32,7 +32,7 @@ def render_message(msg):
 def generate_image(prompt, previous_response_id=None):
     tools = [{"type": "image_generation"}]
     params = {
-        "model": "gpt-image-1",
+        "model": "gpt-4o-mini",
         "input": prompt,
         "tools": tools,
     }
