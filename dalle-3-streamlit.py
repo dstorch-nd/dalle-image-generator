@@ -1,77 +1,112 @@
 import streamlit as st
 from openai import OpenAI
 import base64
-import io
+from io import BytesIO
 from PIL import Image
+import uuid
 
-# Setup
+# Initialize OpenAI client
 OpenAI.api_key = st.secrets["OPENAI_API_KEY"]
 client = OpenAI()
-st.set_page_config(page_title="DALL·E 3 Image Generator with GPT", page_icon="🎨")
+st.set_page_config(page_title="GPT Image Chat", layout="wide")
+st.title("🧠 GPT-Image Chat — Generate & Edit Images")
 
-st.title("🎨 DALL·E 3 Image Generator (Text + Image Inputs)")
+# Session state for conversation
+if "messages" not in st.session_state:
+    # Each item: dict with keys: role ("user"/"assistant"), type ("text"/"image"), content (str), revised_prompt (str), image_b64 (str), response_id (str)
+    st.session_state.messages = []
+if "last_response_id" not in st.session_state:
+    st.session_state.last_response_id = None
 
-# Sidebar options
-st.sidebar.header("Options")
-use_gpt_assist = st.sidebar.checkbox("Use GPT-4 to assist with prompt (if image is uploaded)")
-
-# --- Step 1: Input section ---
-text_input = st.text_area("Your idea (text)", placeholder="Describe the image you want to create.", height=100)
-uploaded_image = st.file_uploader("Optional reference image (if you want GPT to analyze it)", type=["jpg", "jpeg", "png"])
-
-def encode_image(image_data):
-    return base64.b64encode(image_data).decode("utf-8")
-
-# --- Step 2: Generate prompt using GPT ---
-if st.button("Generate Image"):
-    if not text_input and not uploaded_image:
-        st.warning("Please enter a description or upload an image.")
+def render_message(msg):
+    if msg["role"] == "user":
+        st.markdown(f"**You:** {msg['content']}")
     else:
-        with st.spinner("Generating prompt and image..."):
-            try:
-                # Create the base GPT-4 message
-                messages = [
-                    {"role": "system", "content": "You are a creative assistant that crafts prompts for DALL·E 3 image generation. If an image is provided, consider its contents to refine the prompt."},
-                    {"role": "user", "content": text_input}
-                ]
-                
-                # If an image is uploaded, include it in the prompt
-                if uploaded_image:
-                    image = Image.open(uploaded_image)
-                    if image.mode == 'RGBA':
-                        image = image.convert("RGB")
-                    buffered = io.BytesIO()
-                    image.save(buffered, format="JPEG")
-                    image_data = buffered.getvalue()
-                    base64_image = encode_image(image_data)
+        if msg["type"] == "text":
+            st.markdown(f"**Assistant:** {msg['content']}")
+        elif msg["type"] == "image":
+            st.markdown(f"**Assistant (Revised Prompt):** {msg.get('revised_prompt', '')}")
+            image_bytes = base64.b64decode(msg["image_b64"])
+            image = Image.open(BytesIO(image_bytes))
+            st.image(image, use_column_width=True)
 
-                    messages[1]["content"] += "\nPlease consider the following image in crafting the prompt."
-                    messages.append({
-                        "role": "user",
-                        "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
-                    })
+def generate_image(prompt, previous_response_id=None):
+    tools = [{"type": "image_generation"}]
 
-                # Use GPT-4 to refine the prompt
-                chat_response = client.chat.completions.create(
-                    model="gpt-4" if uploaded_image else "gpt-4-turbo",  # Use GPT-4 or GPT-4-turbo
-                    messages=messages
-                )
-                refined_prompt = chat_response.choices[0].message.content.strip()
+    params = {
+        "model": "gpt-4o",
+        "input": prompt,
+        "tools": tools,
+    }
+    if previous_response_id:
+        params["previous_response_id"] = previous_response_id
 
-                st.success("Generated Prompt:")
-                st.text_area("Prompt for DALL·E 3", refined_prompt, height=100)
+    response = client.responses.create(**params)
 
-                # --- Step 3: Generate image using DALL·E 3 ---
-                st.info("Generating image with DALL·E 3...")
-                image_response = client.images.generate(
-                    model="dall-e-3",
-                    prompt=refined_prompt,
-                    size="1024x1024",
-                    quality="standard",
-                    n=1
-                )
-                image_url = image_response.data[0].url
-                st.image(image_url, caption="Generated Image by DALL·E 3", use_container_width=True)
+    # Extract image_generation_call output
+    img_output = None
+    for output in response.output:
+        if output.type == "image_generation_call":
+            img_output = output
+            break
+    if img_output is None:
+        st.error("No image generated.")
+        return None, None, None
 
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
+    return img_output.result, img_output.revised_prompt, response.id
+
+# UI for user input
+with st.form("input_form", clear_on_submit=True):
+    user_text = st.text_area("Enter your message or prompt here:", height=100)
+    uploaded_file = st.file_uploader("Or upload an image to edit (optional):", type=["png", "jpg", "jpeg"])
+    submitted = st.form_submit_button("Send")
+
+if submitted:
+    if not user_text and not uploaded_file:
+        st.warning("Please enter some text or upload an image.")
+    else:
+        # Show user message
+        user_message = {"role": "user", "type": "text", "content": user_text}
+        st.session_state.messages.append(user_message)
+
+        # Prepare prompt for API call
+        prompt = user_text
+        if uploaded_file:
+            # encode image to base64
+            img_bytes = uploaded_file.read()
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            # Append instruction to prompt to edit this image
+            prompt += "\n\nEdit this image as described above."
+        else:
+            img_b64 = None
+
+        # Call OpenAI to generate or edit image
+        with st.spinner("Generating response..."):
+            image_b64, revised_prompt, response_id = generate_image(prompt, st.session_state.last_response_id)
+
+        if image_b64:
+            assistant_message = {
+                "role": "assistant",
+                "type": "image",
+                "content": "",
+                "revised_prompt": revised_prompt,
+                "image_b64": image_b64,
+                "response_id": response_id,
+            }
+            st.session_state.messages.append(assistant_message)
+            st.session_state.last_response_id = response_id
+        else:
+            # Fallback, if no image generated, just add text assistant message
+            assistant_message = {
+                "role": "assistant",
+                "type": "text",
+                "content": "Sorry, I couldn't generate an image for that.",
+            }
+            st.session_state.messages.append(assistant_message)
+
+# Display chat messages
+st.markdown("---")
+st.markdown("### Chat History")
+for msg in st.session_state.messages:
+    render_message(msg)
+    st.markdown("---")
