@@ -1,100 +1,124 @@
 import streamlit as st
 from openai import OpenAI
 import base64
-from io import BytesIO
+import io
 from PIL import Image
 
-# Initialize OpenAI client using secret key in Streamlit
+# Setup
 OpenAI.api_key = st.secrets["OPENAI_API_KEY"]
 client = OpenAI()
+st.set_page_config(page_title="DALL·E 3 Image Generator with GPT", page_icon="🎨")
 
-st.set_page_config(page_title="GPT Image Chat", layout="wide")
-st.title("🧠 GPT-Image Chat — Generate & Edit Images")
+st.title("🎨 DALL·E 3 Image Generator (Text + Image Inputs)")
 
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of dicts with keys: role, type, content, revised_prompt, image_b64, response_id
-if "last_response_id" not in st.session_state:
-    st.session_state.last_response_id = None
+st.sidebar.header("Options")
+use_gpt_assist = st.sidebar.checkbox("Use GPT-4 to assist with prompt (if image is uploaded)")
 
-def render_message(msg):
-    if msg["role"] == "user":
-        st.markdown(f"**You:** {msg['content']}")
+# --- Step 1: Input section ---
+text_input = st.text_area("Your idea (text)", placeholder="Describe the image you want to create.", height=100)
+uploaded_image = st.file_uploader("Optional reference image (if you want GPT to analyze it)", type=["jpg", "jpeg", "png"])
+
+def encode_image(image_data):
+    return base64.b64encode(image_data).decode("utf-8")
+
+if st.button("Generate Image"):
+    if not text_input and not uploaded_image:
+        st.warning("Please enter a description or upload an image.")
     else:
-        if msg["type"] == "text":
-            st.markdown(f"**Assistant:** {msg['content']}")
-        elif msg["type"] == "image":
-            st.markdown(f"**Assistant (Revised Prompt):** {msg.get('revised_prompt', '')}")
-            image_bytes = base64.b64decode(msg["image_b64"])
-            image = Image.open(BytesIO(image_bytes))
-            st.image(image, use_column_width=True)
+        with st.spinner("Generating prompt and image..."):
+            try:
+                # Compose initial messages
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a creative assistant that crafts prompts for DALL·E 3 image generation. "
+                            "If an image is provided, consider its contents to refine the prompt."
+                        )
+                    }
+                ]
 
-def generate_image(prompt, previous_response_id=None):
-    tools = [{"type": "image_generation"}]
-    params = {
-        "model": "gpt-4o-mini",
-        "input": prompt,
-        "tools": tools,
-    }
-    if previous_response_id:
-        params["previous_response_id"] = previous_response_id
+                if use_gpt_assist:
+                    # If user wants GPT assistance and image uploaded, refine prompt
+                    if uploaded_image:
+                        # Encode image and add it as an image message
+                        image = Image.open(uploaded_image)
+                        if image.mode == 'RGBA':
+                            image = image.convert("RGB")
+                        buffered = io.BytesIO()
+                        image.save(buffered, format="JPEG")
+                        image_data = buffered.getvalue()
+                        base64_image = encode_image(image_data)
 
-    response = client.responses.create(**params)
+                        user_content = text_input if text_input else "Please analyze the uploaded image."
+                        messages.append({"role": "user", "content": user_content})
+                        messages.append({
+                            "role": "user",
+                            "content": [{
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                            }]
+                        })
+                    else:
+                        messages.append({"role": "user", "content": text_input})
 
-    # Extract image_generation_call output
-    img_output = None
-    for output in response.output:
-        if output.type == "image_generation_call":
-            img_output = output
-            break
-    if img_output is None:
-        st.error("No image generated.")
-        return None, None, None
+                    # Use GPT-4o-mini to refine the prompt
+                    chat_response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=messages
+                    )
+                    refined_prompt = chat_response.choices[0].message.content.strip()
+                else:
+                    # No GPT prompt assistance, just use user text as prompt
+                    refined_prompt = text_input
 
-    return img_output.result, img_output.revised_prompt, response.id
+                st.success("Final Prompt for Image Generation:")
+                st.text_area("Prompt", refined_prompt, height=100)
 
-# UI form for input
-with st.form("input_form", clear_on_submit=True):
-    user_text = st.text_area("Enter your message or prompt here:", height=100)
-    submitted = st.form_submit_button("Send")
+                # --- Step 3: Generate image using GPT-image tool (via chat) ---
+                # To generate images, you send a special "tool" message in the chat to trigger image generation
+                image_generation_messages = [
+                    {
+                        "role": "user",
+                        "content": refined_prompt
+                    },
+                    {
+                        "role": "tool",
+                        "name": "image_generation",
+                        "content": {
+                            "prompt": refined_prompt,
+                            "n": 1,
+                            "size": "1024x1024"
+                        }
+                    }
+                ]
 
-if submitted:
-    if not user_text.strip():
-        st.warning("Please enter some text.")
-    else:
-        # Add user message
-        st.session_state.messages.append({
-            "role": "user",
-            "type": "text",
-            "content": user_text,
-        })
+                # Call chat completion with GPT-image-1 (the image generation tool is behind this model)
+                image_response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=image_generation_messages
+                )
 
-        # Generate or edit image based on last response ID
-        with st.spinner("Generating image or editing..."):
-            image_b64, revised_prompt, response_id = generate_image(user_text, st.session_state.last_response_id)
+                # The response's message content should contain image info (check the tool response)
+                # Typically, the image URL is inside message.choices[0].message.content or message.tools_response
 
-        if image_b64:
-            # Add assistant image message
-            st.session_state.messages.append({
-                "role": "assistant",
-                "type": "image",
-                "content": "",
-                "revised_prompt": revised_prompt,
-                "image_b64": image_b64,
-                "response_id": response_id,
-            })
-            st.session_state.last_response_id = response_id
-        else:
-            # If no image, fallback text
-            st.session_state.messages.append({
-                "role": "assistant",
-                "type": "text",
-                "content": "Sorry, I couldn't generate an image for that.",
-            })
+                # Extract image URL (depends on exact API; below is an example assumption)
+                message_content = image_response.choices[0].message
+                # For newer APIs, image URLs often come in message.content or a tool response field
 
-# Display chat history
-st.markdown("---")
-st.markdown("### Chat History")
-for msg in st.session_state.messages:
-    render_message(msg)
-    st.markdown("---")
+                # For demonstration, parse image URL from message content if JSON
+                import json
+                try:
+                    parsed = json.loads(message_content.content)
+                    image_url = parsed.get("data", [{}])[0].get("url")
+                except Exception:
+                    # fallback if content is plain text with URL
+                    image_url = message_content.content.strip()
+
+                if image_url:
+                    st.image(image_url, caption="Generated Image by DALL·E 3", use_container_width=True)
+                else:
+                    st.error("Failed to retrieve image URL from the response.")
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
